@@ -10,22 +10,13 @@ const INTERFACE_ADDR: &str = "0.0.0.0";
 const BUFFER_SIZE: usize = 14;
 const VERIFY_PASS: [u8; BUFFER_SIZE] = [69, 108, 32, 80, 115, 121, 32, 67, 111, 110, 103, 114, 111, 111];
 
-pub struct PairingManager<T>
-where
-    T: FnMut(SocketAddr),
-{
-    socket_rev: UdpSocket,
-    socket_send: UdpSocket,
-    buf: [u8; BUFFER_SIZE],
-    rev_handler: T,
-    quit_tx: Option<oneshot::Sender<()>>,
+pub struct PairingManager {
+    pub sender: PairingSender,
+    pub listener: PairingListener,
 }
 
-impl<T> PairingManager<T>
-where
-    T: FnMut(SocketAddr),
-{
-    pub async fn new(rev_handler: T) -> anyhow::Result<Self> {
+impl PairingManager {
+    pub async fn new() -> anyhow::Result<Self> {
         let socket_rev = UdpSocket::bind(SOCK_REV_ADDR).await?;
         let multicast_address = MULTICAST_ADDR.parse::<Ipv4Addr>()?;
         let interface = INTERFACE_ADDR.parse::<Ipv4Addr>()?;
@@ -35,32 +26,62 @@ where
         socket_send.set_broadcast(true)?;
 
         Ok(Self {
-            socket_rev,
-            socket_send,
-            rev_handler,
-            buf: [0; BUFFER_SIZE],
-            quit_tx: None,
+            sender: PairingSender { socket: socket_send },
+            listener: PairingListener::new(socket_rev),
         })
+    }
+
+    pub fn split(self) -> (PairingSender, PairingListener) {
+        (self.sender, self.listener)
+    }
+}
+
+pub struct PairingSender {
+    socket: UdpSocket,
+}
+
+impl PairingSender {
+    pub async fn try_pairing(&mut self) -> anyhow::Result<()> {
+        self.socket.send_to(&VERIFY_PASS, MULTICAST_ADDR_SEND).await?;
+        Ok(())
+    }
+}
+
+pub struct PairingListener
+{
+    socket: UdpSocket,
+    quit_tx: Option<oneshot::Sender<()>>,
+    buf: [u8; BUFFER_SIZE],
+}
+
+impl PairingListener
+{
+    pub fn new(socket: UdpSocket) -> Self {
+        Self {
+            socket,
+            quit_tx: None,
+            buf: [0; BUFFER_SIZE],
+        }
     }
 
     fn verify(&self) -> bool {
         self.buf == VERIFY_PASS
     }
 
-    async fn listen(&mut self) -> anyhow::Result<()> {
+    async fn listen(&mut self, on_pair: Box<dyn Fn(SocketAddr) + Send>) -> anyhow::Result<()> {
         loop {
-            let (amt, src) = self.socket_rev.recv_from(&mut self.buf).await?;
+            let (amt, src) = self.socket.recv_from(&mut self.buf).await?;
             if amt < BUFFER_SIZE {
                 continue;
             }
 
-            if self.verify() && src != self.socket_rev.local_addr()? {
-                (self.rev_handler)(src)
+            if self.verify() && src != self.socket.local_addr()? {
+                (on_pair)(src);
             }
         }
     }
 
-    pub async fn event_loop(&mut self) -> anyhow::Result<()> {
+    pub async fn event_loop(&mut self, on_pair: Box<dyn Fn(SocketAddr) + Send>) -> anyhow::Result<()> {
         if self.quit_tx.is_some() {
             return Ok(());
         }
@@ -70,14 +91,9 @@ where
 
         tokio::select! {
             _ = quit_rx => {},
-            _ = async { self.listen().await } => {}
+            _ = async move { self.listen(on_pair).await } => {}
         }
 
-        Ok(())
-    }
-
-    pub async fn try_pairing(&mut self) -> anyhow::Result<()> {
-        self.socket_send.send_to(&VERIFY_PASS, MULTICAST_ADDR_SEND).await?;
         Ok(())
     }
 
